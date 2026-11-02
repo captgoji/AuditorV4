@@ -1,0 +1,6 @@
+Logs/
+*.log
+Excel/
+Temp_CSV/
+Tools/
+__pycache__/
