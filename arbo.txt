@@ -3,6 +3,7 @@ NewAuditroV2\
 ├─ init.ps1                                     ← installation Python + génération templates
 ├─ modules_config.json                          ← config modules Excel
 ├─ Process_excels.py                            ← injection CSV → Excel
+├─ README.md
 ├─ Scripts\
 │   ├─ PowerShell\
 │   │   ├─ 00_Reconnaissance.ps1                ← scan réseau + audit distant WinRM
@@ -10,11 +11,13 @@ NewAuditroV2\
 │   │   ├─ 11_Audit_comptes.ps1
 │   │   ├─ 12_Audit_Comptes_365.ps1
 │   │   ├─ 13_Arborescence_OU.ps1
-│   │   ├─ 20_Audit_VMs.ps1
+│   │   ├─ 20_Audit_Hyperviseurs.ps1
+│   │   ├─ 21_Audit_VMs.ps1
+│   │   ├─ 22_Audit_Worstation.ps1
+│   │   ├─ 23_Audit_Linux.ps1
 │   │   ├─ 30_Audit_Replication.ps1             ← nécessite 20_Audit_VMs + repadmin (DC)
-│   │   ├─ 40_Audit_Hyperviseurs.ps1
-│   │   ├─ 50_Audit_NTFS.ps1                    ← nécessite AUDIT_NTFS_PATHS défini
-│   │   └─ 60_Audit_GPO.ps1                     ← nécessite RSAT (DC ou membre domaine)
+│   │   ├─ 31_Audit_NTFS.ps1                    ← nécessite AUDIT_NTFS_PATHS défini
+│   │   └─ 32_Audit_GPO.ps1                     ← nécessite RSAT (DC ou membre domaine)
 │   └─ Python\
 │       ├─ TemplateAuditCompte.py
 │       ├─ TemplateAuditGPO.py
@@ -48,7 +51,8 @@ NewAuditroV2\
 │       ├─ nmap-rpc
 │       ├─ nse_main.lua
 │       ├─ scripts\
-│       └─ nselib\
+│       ├─ nselib\
+│       └─ ...
 ├─ Temp_CSV\
 │   ├─ Comptes\
 │   │   ├─ <HOSTNAME>.<DOMAIN>_Audit_comptes_T0.csv

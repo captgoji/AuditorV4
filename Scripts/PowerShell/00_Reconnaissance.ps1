@@ -1,601 +1,848 @@
 ﻿# 00_Reconnaissance.ps1
-# Version : 2.8
-# Derniere modif : Suppression --packet-trace
-# Scan reseau par etapes Nmap → identification serveurs → test WinRM → validation utilisateur → lancement audit distant
+# Version      : 5.2
+# Derniere modif : Decouverte en une passe, parsing XML (-oX), -O corrige (ports d'abord),
+#                  audit distant : rapatriement par sous-dossier (Comptes/AD/HV/VM/NTFS),
+#                  NTFS/GPO conserves hors-DC (serveurs de fichiers), splatting des plages corrige.
+# v5.2          : Sous-dossier AD rapatrie ; exclusions hors DC a jour (14_, 15_, 33_), numeros
+#                  corriges (23_Audit_Linux, 20_Audit_Hyperviseurs)
+# v5.1          : Fallback sans WinRM via PsExec (SMB/445, Domain Admin) : comptes, comptes T0,
+#                  VM (serveur) ou Workstation (poste). PsExec acquis par init.ps1.
+# Role         : Scan reseau, detection OS, audit Windows (WinRM ou PsExec) et Linux (SSH)
+# Usage        : Lance via main.ps1 (processus console dedie). Peut aussi etre lance directement.
+# ============================================================
+# AUDIT: interactive
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 
-# Calcul du chemin racine : fonctionne en execution directe ET en dotsource depuis main.ps1
-$_scriptPath = $MyInvocation.MyCommand.Path
-if (-not $_scriptPath) { $_scriptPath = Join-Path $PSScriptRoot "00_Reconnaissance.ps1" }
-$_scriptDir  = Split-Path $_scriptPath -Parent
+# ─── TRANSCRIPT (main.ps1 fournit AUDIT_SCRIPT_LOG) ─────────
+$transcriptActif = $false
+if ($env:AUDIT_SCRIPT_LOG) {
+    try { Start-Transcript -Path $env:AUDIT_SCRIPT_LOG -Append -Force | Out-Null; $transcriptActif = $true } catch {}
+}
 
-# Structure attendue : NewAuditroV2\Scripts\PowerShell\
-if ((Split-Path $_scriptDir -Leaf) -eq "PowerShell") {
-    $root = Split-Path (Split-Path $_scriptDir -Parent) -Parent
+# ─── CHEMIN RACINE ──────────────────────────────────────────
+$_fichier = $MyInvocation.MyCommand.Path
+if (-not $_fichier) { $_fichier = Join-Path $PSScriptRoot "00_Reconnaissance.ps1" }
+$_dossier = Split-Path $_fichier -Parent
+if ((Split-Path $_dossier -Leaf) -eq "PowerShell") {
+    $root = Split-Path (Split-Path $_dossier -Parent) -Parent
 } else {
-    $root = $_scriptDir
+    $root = $_dossier
 }
+
+# ─── CHEMINS ────────────────────────────────────────────────
+$runId      = if ($env:AUDIT_RUN_ID) { $env:AUDIT_RUN_ID } else { Get-Date -Format "yyyyMMdd_HHmmss" }
 $logsDir    = Join-Path $root "Logs"
-$tempCsv    = Join-Path $root "Temp_CSV"
-$runId      = Get-Date -Format "yyyyMMdd_HHmmss"
+$tempCsv    = if ($env:AUDIT_TEMP_CSV) { $env:AUDIT_TEMP_CSV } else { Join-Path $root "Temp_CSV" }
 $recoDir    = Join-Path $logsDir "Reconnaissance_$runId"
-$csvResults = Join-Path $tempCsv "Reconnaissance_$runId.csv"
+$csvResultat= Join-Path $tempCsv "Reconnaissance_$runId.csv"
 
-New-Item -ItemType Directory -Force -Path $recoDir  | Out-Null
-New-Item -ItemType Directory -Force -Path $tempCsv  | Out-Null
+New-Item -ItemType Directory -Force -Path $recoDir | Out-Null
+New-Item -ItemType Directory -Force -Path $tempCsv | Out-Null
 
-# Fichiers de travail inter-etapes
-$fileStep1  = Join-Path $recoDir "step1_hosts_up.txt"
-$fileStep2  = Join-Path $recoDir "step2_servers.xml"
-$fileStep3  = Join-Path $recoDir "step3_winrm.xml"
-$logStep1   = Join-Path $recoDir "step1_scan_updown.log"
-$logStep2   = Join-Path $recoDir "step2_scan_os.log"
-$logStep3   = Join-Path $recoDir "step3_scan_winrm.log"
+$xmlDiscovery = Join-Path $recoDir "etape1_decouverte.xml"
+$xmlPorts     = Join-Path $recoDir "etape2_ports.xml"
+$xmlOS        = Join-Path $recoDir "etape2_os.xml"
+$logGeneral   = Join-Path $recoDir "reconnaissance.log"
 
-# ─────────────────────────────────────────────────────────────
-# FONCTIONS UTILITAIRES
-# ─────────────────────────────────────────────────────────────
+Write-Host ""
+Write-Host "------------------------------------------------------------" -ForegroundColor Magenta
+Write-Host "  RECONNAISSANCE RESEAU - Framework Audit"                   -ForegroundColor Magenta
+Write-Host "------------------------------------------------------------" -ForegroundColor Magenta
+Write-Host "  Logs : $recoDir" -ForegroundColor DarkGray
+Write-Host "  CSV  : $csvResultat" -ForegroundColor DarkGray
+Write-Host ""
 
-function Write-Step {
-    param([string]$Msg, [string]$Color = "Cyan")
-    Write-Host ""
-    Write-Host ("-" * 60) -ForegroundColor $Color
-    Write-Host "  $Msg" -ForegroundColor $Color
-    Write-Host ("-" * 60) -ForegroundColor $Color
-    Write-Host ""
+# ─── UTILITAIRES ────────────────────────────────────────────
+function Ecrire_Log {
+    param([string]$Message)
+    Add-Content -Path $logGeneral -Value "[$(Get-Date -Format 'HH:mm:ss')] $Message" -Encoding UTF8
 }
 
-function Write-Log {
-    param([string]$File, [string]$Msg)
-    $line = "[$(Get-Date -Format 'HH:mm:ss')] $Msg"
-    Write-Host $line
-    Add-Content -Path $File -Value $line -Encoding UTF8
+function Demander_OuiNon {
+    param([string]$Question, [string]$Couleur = "Yellow")
+    Write-Host "$Question [O/N] : " -ForegroundColor $Couleur -NoNewline
+    return (Read-Host) -match "^[OoYy]"
 }
 
-function Confirm-Action {
-    param([string]$Question, [string]$Color = "Yellow")
-    Write-Host "$Question [O/N] : " -ForegroundColor $Color -NoNewline
-    $r = Read-Host
-    return ($r -match '^[OoYy]')
+# Execute Nmap, ecrit le XML demande, journalise la sortie texte et renvoie le chemin XML (ou $null)
+function Invoke-Nmap {
+    param(
+        [string]$NmapExe,
+        [string[]]$Arguments,   # sans -oX (ajoute ici)
+        [string]$XmlOut,
+        [string]$Libelle
+    )
+    $args = @($Arguments) + @("-oX", $XmlOut)
+    Ecrire_Log "nmap $($args -join ' ')"
+    Write-Host "  $Libelle..." -ForegroundColor DarkCyan
+    try {
+        $sortie = & $NmapExe @args 2>&1
+    } catch {
+        Write-Warning "  Echec Nmap ($Libelle) : $_"
+        Ecrire_Log "ERREUR Nmap ($Libelle) : $_"
+        return $null
+    }
+    $sortie | ForEach-Object { Ecrire_Log "  $_" }
+    if (-not (Test-Path $XmlOut)) {
+        Write-Warning "  Nmap n'a pas produit de XML ($Libelle) - voir $logGeneral"
+        return $null
+    }
+    return $XmlOut
 }
 
-# ─────────────────────────────────────────────────────────────
-# ETAPE 0 : INSTALLATION NMAP
-# ─────────────────────────────────────────────────────────────
+# Parse un XML Nmap -> liste d'objets { IP, Hostname, Etat, OS, Precision, Ports[] }
+function Lire_XmlNmap {
+    param([string]$Fichier)
+    $resultats = [System.Collections.Generic.List[object]]::new()
+    if (-not $Fichier -or -not (Test-Path $Fichier)) { return ,$resultats }
+    try {
+        [xml]$doc = Get-Content -LiteralPath $Fichier -Raw -Encoding UTF8
+    } catch {
+        Write-Warning "  XML Nmap illisible ($Fichier) : $_"
+        return ,$resultats
+    }
 
-function Get-NmapExe {
-    Write-Step "ETAPE 0 : Verification Nmap"
+    foreach ($h in $doc.nmaprun.host) {
+        # IPv4 uniquement
+        $ip = ($h.address | Where-Object { $_.addrtype -eq 'ipv4' } | Select-Object -First 1).addr
+        if (-not $ip) { continue }
 
-    # 1. Nmap portable dans Tools\Nmap\ (prioritaire)
+        $nom = $null
+        if ($h.hostnames -and $h.hostnames.hostname) {
+            $nom = ($h.hostnames.hostname | Select-Object -First 1).name
+        }
+        if (-not $nom) { $nom = $ip }
+
+        $etat = if ($h.status) { $h.status.state } else { "unknown" }
+
+        $os = "Inconnu"; $precision = $null
+        if ($h.os -and $h.os.osmatch) {
+            $meilleur  = $h.os.osmatch | Select-Object -First 1
+            $os        = $meilleur.name
+            $precision = $meilleur.accuracy
+        }
+
+        $ports = @()
+        if ($h.ports -and $h.ports.port) {
+            foreach ($p in $h.ports.port) {
+                if ($p.state.state -eq 'open') {
+                    $svc = if ($p.service) { $p.service.name } else { "" }
+                    $ports += [PSCustomObject]@{ Port = [int]$p.portid; Service = $svc }
+                }
+            }
+        }
+
+        $resultats.Add([PSCustomObject]@{
+            IP = $ip; Hostname = $nom; Etat = $etat; OS = $os; Precision = $precision; Ports = $ports
+        })
+    }
+    return ,$resultats
+}
+
+# ─── GESTION NMAP (inchangee pour l'essentiel) ──────────────
+function Trouver_Nmap {
     $portablePath = Join-Path $root "Tools\Nmap\nmap.exe"
     if (Test-Path $portablePath) {
         $ver = & $portablePath --version 2>&1 | Select-Object -First 1
-        Write-Host "  Nmap portable detecte : $ver" -ForegroundColor Green
-
-        # Npcap est gere par init.ps1 - verifier seulement que le service tourne
-        $npcapService = Get-Service -Name npcap -ErrorAction SilentlyContinue
-        if (-not $npcapService -or $npcapService.Status -ne "Running") {
-            Write-Warning "Npcap non demarre. Lance init.ps1 d abord ou installe npcap-1.88.exe depuis Tools\Nmap\"
-            exit 1
+        if ($ver -match "Nmap") {
+            Write-Host "  Nmap portable : $ver" -ForegroundColor Green
+            return $portablePath
         }
-        Write-Host "  Npcap OK." -ForegroundColor Green
-        return $portablePath
+        Write-Warning "  Nmap portable present mais non fonctionnel (DLL manquante)"
+        if (Demander_OuiNon "  Tenter une reparation automatique via l installeur ?") { return Reparer_Nmap }
+        return $null
     }
 
-    # 2. Fallback : Nmap installe sur le systeme
-    $nmapCmd = Get-Command nmap -ErrorAction SilentlyContinue
-    $systemPaths = @(
-        $(if ($nmapCmd) { $nmapCmd.Source } else { $null }),
+    $cheminsSysteme = @(
+        (Get-Command nmap -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source),
         "$env:ProgramFiles\Nmap\nmap.exe",
         "${env:ProgramFiles(x86)}\Nmap\nmap.exe"
     ) | Where-Object { $_ -and (Test-Path $_) }
 
-    if ($systemPaths) {
-        $ver = & $systemPaths[0] --version 2>&1 | Select-Object -First 1
-        Write-Host "  Nmap systeme detecte : $ver" -ForegroundColor Green
-        return $systemPaths[0]
+    if ($cheminsSysteme) {
+        $ver = & $cheminsSysteme[0] --version 2>&1 | Select-Object -First 1
+        if ($ver -match "Nmap") {
+            Write-Host "  Nmap systeme : $ver" -ForegroundColor Green
+            return $cheminsSysteme[0]
+        }
     }
 
-    Write-Error "Nmap introuvable.`nPlace nmap.exe et ses DLLs dans : $root\Tools\Nmap\`nTelecharge la version zip depuis https://nmap.org/download.html"
-    exit 1
+    $installeur = Get-ChildItem (Join-Path $root "Tools\Nmap") -Filter "nmap*setup*.exe" -ErrorAction SilentlyContinue |
+                  Select-Object -First 1 -ExpandProperty FullName
+    if ($installeur) {
+        Write-Host "  Nmap introuvable - installeur disponible : $(Split-Path $installeur -Leaf)" -ForegroundColor Yellow
+        if (Demander_OuiNon "  Installer Nmap maintenant ?") {
+            Write-Host "  Lancement de l installeur..." -ForegroundColor Yellow
+            Start-Process $installeur -Wait
+            $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" +
+                        [System.Environment]::GetEnvironmentVariable("PATH","User")
+            return Trouver_Nmap
+        }
+    }
+
+    Write-Error "Nmap introuvable. Options :`n  1. Copier nmap.exe dans Tools\Nmap\`n  2. Copier nmap-7.99-setup.exe dans Tools\Nmap\`n  3. Installer depuis https://nmap.org"
+    return $null
 }
 
-# ─────────────────────────────────────────────────────────────
-# ETAPE 1 : SCAN UP/DOWN
-# ─────────────────────────────────────────────────────────────
+function Reparer_Nmap {
+    $installeur = Get-ChildItem (Join-Path $root "Tools\Nmap") -Filter "nmap*setup*.exe" -ErrorAction SilentlyContinue |
+                  Select-Object -First 1 -ExpandProperty FullName
+    if (-not $installeur) { Write-Warning "Installeur nmap-setup.exe introuvable dans Tools\Nmap\"; return $null }
 
-function Invoke-Step1-HostDiscovery {
-    param([string]$NmapExe, [string[]]$Ranges)
+    Write-Host "  Installation de Nmap pour reparation..." -ForegroundColor Yellow
+    Start-Process $installeur -Wait
+    $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" +
+                [System.Environment]::GetEnvironmentVariable("PATH","User")
 
-    Write-Step "ETAPE 1 : Decouverte des hotes actifs (ping sweep)"
-    Write-Log $logStep1 "Debut Step1 - Plages : $($Ranges -join ', ')"
+    $cheminsSysteme = @(
+        (Get-Command nmap -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source),
+        "$env:ProgramFiles\Nmap\nmap.exe",
+        "${env:ProgramFiles(x86)}\Nmap\nmap.exe"
+    ) | Where-Object { $_ -and (Test-Path $_) }
 
-    $rangeArgs = $Ranges -join " "
-    $cmd = "`"$NmapExe`" -sn -T4 --open $rangeArgs -oG `"$fileStep1`""
-    Write-Log $logStep1 "Commande : nmap -sn -T4 --open $rangeArgs"
-
-    Write-Host "  Ping sweep en cours (T2, peut prendre quelques minutes)..." -ForegroundColor DarkCyan
-    $output = & $NmapExe -sn -T4 --open -v --stats-every 15s $rangeArgs 2>&1
-    $output | ForEach-Object {
-        Write-Log $logStep1 $_
-        if ($_ -match "Nmap scan report|Stats:|hosts up|host up|Initiating") {
-            Write-Host "  > $_" -ForegroundColor DarkCyan
+    if ($cheminsSysteme) {
+        $ver = & $cheminsSysteme[0] --version 2>&1 | Select-Object -First 1
+        if ($ver -match "Nmap") {
+            Write-Host "  Nmap installe et fonctionnel : $ver" -ForegroundColor Green
+            $script:NmapInstallePourReparation = $cheminsSysteme[0]
+            return $cheminsSysteme[0]
         }
     }
-    $output | Out-File $fileStep1 -Encoding UTF8
-
-    # Parser les IPs up depuis la sortie nmap
-    $hostsUp = $output | Where-Object { $_ -match "Nmap scan report for" } | ForEach-Object {
-        if ($_ -match 'for\s+(\S+)\s+\((\d[\d.]+)\)') {
-            [PSCustomObject]@{ Hostname = $Matches[1]; IP = $Matches[2] }
-        } elseif ($_ -match 'for\s+(\d[\d.]+)') {
-            [PSCustomObject]@{ Hostname = $Matches[1]; IP = $Matches[1] }
-        }
-    }
-
-    Write-Log $logStep1 "Hotes actifs detectes : $($hostsUp.Count)"
-    Write-Host ""
-    Write-Host "  Hotes actifs trouves : $($hostsUp.Count)" -ForegroundColor Green
-    $hostsUp | ForEach-Object { Write-Host "    - $($_.IP)  $($_.Hostname)" -ForegroundColor DarkCyan }
-
-    return $hostsUp
+    Write-Warning "Reparation echouee - Nmap toujours non fonctionnel apres installation"
+    return $null
 }
 
-# ─────────────────────────────────────────────────────────────
-# ETAPE 2 : IDENTIFICATION SERVEURS (OS fingerprint)
-# ─────────────────────────────────────────────────────────────
-
-function Invoke-Step2-ServerIdentification {
-    param([string]$NmapExe, [object[]]$Hosts)
-
-    Write-Step "ETAPE 2 : Identification des serveurs (OS fingerprinting)"
-    Write-Log $logStep2 "Debut Step2 - $($Hosts.Count) hotes a analyser"
-
-    $ipList = @($Hosts | Select-Object -ExpandProperty IP)
-    $ips = $ipList -join " "
-    Write-Log $logStep2 "Commande : nmap -O --osscan-guess -T4 $ips"
-
-    Write-Host "  OS fingerprinting en cours..." -ForegroundColor DarkCyan
-    $output = & $NmapExe -O --osscan-guess -T4 -v --stats-every 15s @ipList 2>&1
-    $output | ForEach-Object {
-        Write-Log $logStep2 $_
-        if ($_ -match "Nmap scan report|OS details|Aggressive OS guesses") {
-            Write-Host "  >> $_" -ForegroundColor Green
-        }
-        elseif ($_ -match "Stats:|Initiating|Completed") {
-            Write-Host "  > $_" -ForegroundColor DarkCyan
-        }
-    }
-
-    # Parser la sortie pour identifier les serveurs Windows Server / Linux Server
-    $servers   = [System.Collections.Generic.List[object]]::new()
-    $currentIP = $null
-    $currentHN = $null
-
-    foreach ($line in $output) {
-        if ($line -match 'Nmap scan report for\s+(\S+)\s+\((\d[\d.]+)\)') {
-            $currentHN = $Matches[1]; $currentIP = $Matches[2]
-        } elseif ($line -match 'Nmap scan report for\s+(\d[\d.]+)') {
-            $currentIP = $Matches[1]; $currentHN = $Matches[1]
-        }
-
-        if ($currentIP -and $line -match 'OS details:|Aggressive OS guesses:') {
-            $osDetail = ($line -replace 'OS details:|Aggressive OS guesses:', '').Trim()
-            $isServer = $osDetail -match 'Windows Server|Server \d{4}|Linux.*[Ss]erver|Ubuntu Server|Debian|CentOS|Red Hat|RHEL|Hyper-V'
-
-            if ($isServer) {
-                $existing = $servers | Where-Object { $_.IP -eq $currentIP }
-                if (-not $existing) {
-                    $servers.Add([PSCustomObject]@{
-                        Hostname = $currentHN
-                        IP       = $currentIP
-                        OSDetail = $osDetail.Substring(0, [Math]::Min($osDetail.Length, 80))
-                    })
-                    Write-Log $logStep2 "  SERVEUR detecte : $currentIP ($currentHN) - $osDetail"
-                }
-            }
-        }
-    }
-
-    # Fallback : si nmap n'a pas pu fingerprinter l'OS (pare-feu bloque ICMP TTL)
-    # on inclut les hotes avec ports serveur ouverts (445, 3389, 5985, 22)
-    Write-Host "  Scan ports serveur (fallback)..." -ForegroundColor DarkCyan
-    $fallbackOutput = & $NmapExe -p 22,445,3389,5985,5986 --open -T4 -v --stats-every 15s @ipList 2>&1
-    $fallbackOutput | ForEach-Object {
-        Write-Log $logStep2 "  [fallback] $_"
-        if ($_ -match "open|Stats:|Initiating") {
-            Write-Host "  > [fallback] $_" -ForegroundColor DarkGray
-        }
-    }
-
-    $currentIP = $null; $currentHN = $null
-    foreach ($line in $fallbackOutput) {
-        if ($line -match 'Nmap scan report for\s+(\S+)\s+\((\d[\d.]+)\)') {
-            $currentHN = $Matches[1]; $currentIP = $Matches[2]
-        } elseif ($line -match 'Nmap scan report for\s+(\d[\d.]+)') {
-            $currentIP = $Matches[1]; $currentHN = $Matches[1]
-        }
-        if ($currentIP -and $line -match '(22|445|3389|5985|5986)/tcp\s+open') {
-            if (-not ($servers | Where-Object { $_.IP -eq $currentIP })) {
-                $servers.Add([PSCustomObject]@{
-                    Hostname = $currentHN
-                    IP       = $currentIP
-                    OSDetail = "Inconnu (ports serveur ouverts - fingerprint echoue)"
-                })
-                Write-Log $logStep2 "  SERVEUR fallback : $currentIP ($currentHN)"
-            }
-        }
-    }
-
-    Write-Log $logStep2 "Serveurs identifies : $($servers.Count)"
-    return $servers
-}
-
-# ─────────────────────────────────────────────────────────────
-# ETAPE 3 : TEST WINRM
-# ─────────────────────────────────────────────────────────────
-
-function Invoke-Step3-WinRMCheck {
-    param([string]$NmapExe, [object[]]$Servers)
-
-    Write-Step "ETAPE 3 : Test WinRM (ports 5985/5986)"
-    Write-Log $logStep3 "Debut Step3 - $($Servers.Count) serveurs a tester"
-
-    $ipList = @($Servers | Select-Object -ExpandProperty IP)
-    $ips    = $ipList -join " "
-    Write-Host "  Test WinRM (ports 5985/5986)..." -ForegroundColor DarkCyan
-    $output = & $NmapExe -p 5985,5986 --open -T4 -v --stats-every 10s @ipList 2>&1
-    $output | ForEach-Object {
-        Write-Log $logStep3 $_
-        if ($_ -match "open|Stats:|Nmap scan report|Initiating") {
-            Write-Host "  > $_" -ForegroundColor DarkCyan
-        }
-    }
-
-    # IPs avec WinRM ouvert
-    $winrmIPs  = [System.Collections.Generic.List[string]]::new()
-    $currentIP = $null
-
-    foreach ($line in $output) {
-        if ($line -match 'Nmap scan report for\s+\S+\s+\((\d[\d.]+)\)') {
-            $currentIP = $Matches[1]
-        } elseif ($line -match 'Nmap scan report for\s+(\d[\d.]+)') {
-            $currentIP = $Matches[1]
-        }
-        if ($currentIP -and $line -match '598[56]/tcp\s+open') {
-            if (-not $winrmIPs.Contains($currentIP)) {
-                $winrmIPs.Add($currentIP)
-                Write-Log $logStep3 "  WinRM ouvert : $currentIP"
-            }
-        }
-    }
-
-    # Enrichir les objets serveur
-    foreach ($srv in $Servers) {
-        $srv | Add-Member -NotePropertyName WinRM -NotePropertyValue ($winrmIPs.Contains($srv.IP)) -Force
-    }
-
-    Write-Log $logStep3 "Serveurs avec WinRM : $($winrmIPs.Count) / $($Servers.Count)"
-    return $Servers
-}
-
-# ─────────────────────────────────────────────────────────────
-# ETAPE 4 : VALIDATION UTILISATEUR
-# ─────────────────────────────────────────────────────────────
-
-function Invoke-Step4-UserValidation {
-    param([object[]]$Servers)
-
-    Write-Step "ETAPE 4 : Validation des cibles par l'utilisateur"
-
-    $validated = [System.Collections.Generic.List[object]]::new()
-
-    foreach ($srv in $Servers) {
-        $winrmStatus = if ($srv.WinRM) { "OUI" } else { "NON" }
-        $color       = if ($srv.WinRM) { "Green" } else { "DarkGray" }
-
-        Write-Host ""
-        Write-Host "  +-- Serveur detecte ----------------------------------" -ForegroundColor Cyan
-        Write-Host "  |  Hostname : $($srv.Hostname)" -ForegroundColor White
-        Write-Host "  |  IP       : $($srv.IP)" -ForegroundColor White
-        Write-Host "  |  OS       : $($srv.OSDetail)" -ForegroundColor White
-        Write-Host "  |  WinRM    : $winrmStatus" -ForegroundColor $color
-        Write-Host "  +------------------------------------------------" -ForegroundColor Cyan
-
-        $skip = $false
-
-        if (-not $srv.WinRM) {
-            Write-Host "  WinRM inactif sur cette machine. " -ForegroundColor DarkGray -NoNewline
-            $include = Confirm-Action "Inclure quand meme dans le CSV (sans audit distant) ?"
-            if (-not $include) {
-                Write-Host "  -> Ignore." -ForegroundColor DarkGray
-                continue
-            }
-            $skip = $true
-            $skipRaison = "WinRM inactif"
-        } else {
-            $launch = Confirm-Action "  Inclure et auditer ce serveur ?" "Yellow"
-            if (-not $launch) {
-                $skip = $true
-                Write-Host "  Raison du skip (laisser vide si aucune) : " -ForegroundColor DarkGray -NoNewline
-                $skipRaison = Read-Host
-                if (-not $skipRaison) { $skipRaison = "Skippe manuellement" }
-                Write-Host "  -> Skip : $skipRaison" -ForegroundColor DarkGray
-            } else {
-                $skipRaison = ""
-            }
-        }
-
-        $validated.Add([PSCustomObject]@{
-            Hostname    = $srv.Hostname
-            IP          = $srv.IP
-            OSDetail    = $srv.OSDetail
-            WinRM       = $srv.WinRM
-            Skip        = if ($skip) { "Oui" } else { "Non" }
-            SkipRaison  = $skipRaison
-        })
-    }
-
-    return $validated
-}
-
-# ─────────────────────────────────────────────────────────────
-# ETAPE 5 : EXPORT CSV + LANCEMENT AUDIT DISTANT
-# ─────────────────────────────────────────────────────────────
-
-function Invoke-Step5-AuditRemote {
-    param([object[]]$Targets)
-
-    Write-Step "ETAPE 5 : Export CSV et lancement des audits distants"
-
-    # Export CSV resultats reconnaissance
-    $Targets | Select-Object Hostname, IP, OSDetail, WinRM, Skip, SkipRaison |
-        Export-Csv -Path $csvResults -NoTypeInformation -Encoding UTF8
-    Write-Host "  CSV reconnaissance : $csvResults" -ForegroundColor Green
-
-    # Recuperer les IPs locales pour exclure la machine courante
-    $localIPs = @(
-        [System.Net.Dns]::GetHostAddresses([System.Net.Dns]::GetHostName()) |
-        Where-Object { $_.AddressFamily -eq "InterNetwork" } |
-        ForEach-Object { $_.ToString() }
+function Desinstaller_Nmap {
+    $cleReg = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
     )
-    Write-Host "  IPs locales detectees : $($localIPs -join ', ')" -ForegroundColor DarkGray
+    $entree = $cleReg | ForEach-Object { Get-ChildItem $_ -ErrorAction SilentlyContinue } |
+              ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
+              Where-Object { $_.DisplayName -like "*Nmap*" } | Select-Object -First 1
+    if (-not $entree) { return }
 
-    $toAudit = $Targets | Where-Object {
-        $_.Skip -eq "Non" -and $_.WinRM -eq $true -and $_.IP -notin $localIPs
-    }
-
-    # Signaler les machines locales exclues
-    $selfTargets = $Targets | Where-Object { $_.IP -in $localIPs }
-    if ($selfTargets) {
-        foreach ($s in $selfTargets) {
-            Write-Host "  [SKIP] $($s.IP) est la machine locale - audit distant ignore." -ForegroundColor DarkGray
-        }
-    }
-
-    if (-not $toAudit) {
-        Write-Host "  Aucune machine distante a auditer (toutes skippees, WinRM inactif, ou machine locale)." -ForegroundColor Yellow
-        return
-    }
-
-    Write-Host "  $($toAudit.Count) machine(s) distante(s) a auditer via WinRM." -ForegroundColor Cyan
-
-    $mainScript = Join-Path $root "main.ps1"
-    if (-not (Test-Path $mainScript)) {
-        Write-Warning "main.ps1 introuvable dans $root - audit distant impossible."
-        return
-    }
-
-    foreach ($target in $toAudit) {
-        Write-Host ""
-        Write-Host "  >> Audit distant : $($target.Hostname) ($($target.IP))" -ForegroundColor Cyan
-
-        # Determiner si la machine est dans le domaine courant
-        $currentDomain = (Get-CimInstance Win32_ComputerSystem).Domain
-        $inDomain      = $target.Hostname -match "\.$([regex]::Escape($currentDomain))$" -or
-                         $target.Hostname -eq $target.IP -eq $false
-
-        $credParams = @{}
-
-        # Ajouter l IP dans TrustedHosts si connexion par IP
-        # (requis quand la cible n est pas joignable via Kerberos/FQDN)
-        $connectTarget = $target.IP
-        if ($target.Hostname -ne $target.IP -and $target.Hostname -match "\." ) {
-            # On a un FQDN - tenter par nom d abord (Kerberos si meme domaine)
-            $connectTarget = $target.Hostname
-        }
-
-        $currentTrusted = (Get-Item WSMan:\localhost\Client\TrustedHosts -ErrorAction SilentlyContinue).Value
-        $alreadyTrusted = $currentTrusted -eq "*" -or $currentTrusted -split "," -contains $target.IP
-
-        if (-not $alreadyTrusted) {
-            Write-Host "  Ajout de $($target.IP) dans TrustedHosts..." -ForegroundColor DarkGray
-            $newTrusted = if ($currentTrusted -and $currentTrusted -ne "") { "$currentTrusted,$($target.IP)" } else { $target.IP }
-            Set-Item WSMan:\localhost\Client\TrustedHosts -Value $newTrusted -Force -ErrorAction SilentlyContinue
-        }
-
-        if (-not $inDomain -or $target.Hostname -eq $target.IP) {
-            Write-Host "  Machine hors domaine - credentials requis." -ForegroundColor Yellow
-            try {
-                $cred = Get-Credential -Message "Credentials pour $($target.Hostname) ($($target.IP))"
-                $credParams['Credential'] = $cred
-            } catch {
-                Write-Warning "Credentials annules - $($target.Hostname) ignore."
-                continue
-            }
-        }
-
-        # Dossier de sortie distant pour les CSV
-        $remoteOutputDir = "C:\Windows\Temp\Audit_$runId"
-
-        try {
-            # Tester la connexion WinRM
-            $session = New-PSSession -ComputerName $connectTarget @credParams -ErrorAction Stop
-
-            # Creer le dossier temporaire sur la machine distante
-            Invoke-Command -Session $session -ScriptBlock {
-                param($dir)
-                New-Item -ItemType Directory -Force -Path $dir | Out-Null
-                # Sous-dossiers attendus par les scripts
-                foreach ($sub in @("Comptes","HV","VM")) {
-                    New-Item -ItemType Directory -Force -Path "$dir\$sub" | Out-Null
-                }
-            } -ArgumentList $remoteOutputDir
-
-            # Copier tous les scripts PS sur la machine distante
-            # Scripts exclus de l execution distante via WinRM :
-            #   00_* : scripts locaux uniquement (reconnaissance reseau, etc.)
-            #   12_Audit_Comptes_365.ps1 : necessite Connect-MgGraph interactif + tenant M365,
-            #                              pas applicable sur un serveur AD/HV distant
-            $excludeRemote = @(
-                "^00_",
-                "^12_Audit_Comptes_365"
-            )
-            $psScripts = Get-ChildItem -Path (Join-Path $root "Scripts\PowerShell") -Filter "*.ps1" -File |
-                         Where-Object {
-                             $name = $_.Name
-                             -not ($excludeRemote | Where-Object { $name -match $_ })
-                         }
-            Write-Host "    Scripts a executer a distance ($($psScripts.Count)) :" -ForegroundColor DarkGray
-            $psScripts | ForEach-Object { Write-Host "      - $($_.Name)" -ForegroundColor DarkGray }
-            foreach ($s in $psScripts) {
-                Copy-Item -Path $s.FullName -Destination $remoteOutputDir -ToSession $session -Force
-            }
-
-            # Executer chaque script a distance
-            foreach ($s in $psScripts) {
-                $remotePath = "$remoteOutputDir\$($s.Name)"
-                Write-Host "    - Execution distante : $($s.Name)" -ForegroundColor DarkCyan
-
-                try {
-                    Invoke-Command -Session $session -ScriptBlock {
-                        param($script, $csvDir)
-                        $env:AUDIT_TEMP_CSV     = $csvDir
-                        $env:AUDIT_TEMP_COMPTES = "$csvDir\Comptes"
-                        $env:AUDIT_TEMP_HV      = "$csvDir\HV"
-                        $env:AUDIT_TEMP_VM      = "$csvDir\VM"
-                        & $script
-                    } -ArgumentList $remotePath, $remoteOutputDir -ErrorAction Stop
-                } catch {
-                    Write-Warning "    Erreur sur $($s.Name) : $_"
-                }
-            }
-
-            # Rapatrier les CSV
-            $localDest = Join-Path $tempCsv $target.Hostname
-            New-Item -ItemType Directory -Force -Path $localDest | Out-Null
-
-            $remoteFiles = Invoke-Command -Session $session -ScriptBlock {
-                param($dir)
-                Get-ChildItem -Path $dir -Filter "*.csv" -Recurse | Select-Object -ExpandProperty FullName
-            } -ArgumentList $remoteOutputDir
-
-            foreach ($rf in $remoteFiles) {
-                $localFile = Join-Path $localDest (Split-Path $rf -Leaf)
-                Copy-Item -Path $rf -Destination $localFile -FromSession $session -Force
-                Write-Host "    CSV rapatrie : $(Split-Path $rf -Leaf)" -ForegroundColor Green
-            }
-
-            # Nettoyage dossier temp distant
-            Invoke-Command -Session $session -ScriptBlock {
-                param($dir) Remove-Item -Path $dir -Recurse -Force -ErrorAction SilentlyContinue
-            } -ArgumentList $remoteOutputDir
-
-            Remove-PSSession $session
-            Write-Host "  << $($target.Hostname) termine." -ForegroundColor Green
-
-        } catch {
-            Write-Warning "Connexion WinRM echouee sur $($target.Hostname) ($($target.IP)) : $_"
-        }
+    $cmd = $entree.UninstallString
+    $exe = if ($cmd -match '"([^"]+)"') { $Matches[1] } else { ($cmd -split " ")[0] }
+    if (Test-Path $exe) {
+        Write-Host "  Desinstallation de Nmap (reparation temporaire)..." -ForegroundColor DarkGray
+        Start-Process $exe -ArgumentList "/S" -Wait -NoNewWindow
+        Write-Host "  Nmap desinstalle." -ForegroundColor DarkGray
     }
 }
 
-# ─────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────
+function Verifier_Npcap {
+    $service = Get-Service -Name npcap -ErrorAction SilentlyContinue
+    if ($service -and $service.Status -eq "Running") {
+        Write-Host "  Npcap OK." -ForegroundColor Green
+        return $true
+    }
+    $installeur = Join-Path $root "Tools\Nmap\npcap-installer.exe"
+    if (Test-Path $installeur) {
+        Write-Host "  Npcap absent - lancement de l installeur..." -ForegroundColor Yellow
+        Write-Host "  Cocher 'WinPcap API-compatible mode' dans l installeur." -ForegroundColor DarkGray
+        Start-Process $installeur -Wait
+        $service = Get-Service -Name npcap -ErrorAction SilentlyContinue
+        if ($service) {
+            Start-Service npcap -ErrorAction SilentlyContinue
+            Write-Host "  Npcap installe." -ForegroundColor Green
+            return $true
+        }
+    }
+    Write-Warning "Npcap non disponible - placer npcap-installer.exe dans Tools\Nmap\"
+    return $false
+}
 
-Write-Step "RECONNAISSANCE RESEAU - Framework Audit" "Magenta"
-Write-Host "  Logs        : $recoDir" -ForegroundColor DarkGray
-Write-Host "  CSV resultats : $csvResults" -ForegroundColor DarkGray
+# ─── CLIENT SSH ─────────────────────────────────────────────
+function Trouver_SSH {
+    $ssh = Get-Command ssh -ErrorAction SilentlyContinue
+    if ($ssh) { return $ssh.Source }
 
-# Avertissement
+    Write-Host "  ssh.exe introuvable - tentative d installation du client OpenSSH..." -ForegroundColor Yellow
+    try {
+        Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0 -ErrorAction Stop | Out-Null
+        $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" +
+                    [System.Environment]::GetEnvironmentVariable("PATH","User")
+        $ssh = Get-Command ssh -ErrorAction SilentlyContinue
+        if ($ssh) { Write-Host "  OpenSSH client installe." -ForegroundColor Green; return $ssh.Source }
+    } catch {
+        Write-Warning "  Impossible d installer OpenSSH client : $_"
+    }
+
+    $plink = Join-Path $root "Tools\plink.exe"
+    if (Test-Path $plink) {
+        Write-Host "  Plink.exe detecte (PuTTY SSH client)." -ForegroundColor Green
+        return $plink
+    }
+    Write-Warning "Aucun client SSH disponible - audit Linux impossible.`nPlacer plink.exe dans Tools\ ou installer OpenSSH client."
+    return $null
+}
+
+# ─── AVERTISSEMENT ──────────────────────────────────────────
+Write-Host "/!\ AVERTISSEMENT /!\" -ForegroundColor Red
+Write-Host "Ce script effectue un scan reseau actif (Nmap)." -ForegroundColor Yellow
+Write-Host "Assure-toi d avoir les autorisations necessaires." -ForegroundColor Yellow
+Write-Host "Le scan peut declencher des alertes sur les equipements sensibles." -ForegroundColor Yellow
+Write-Host "(firewalls, IDS/IPS, equipements reseau, systemes industriels OT/ICS)" -ForegroundColor Yellow
 Write-Host ""
-Write-Host "  /!\ AVERTISSEMENT /!\" -ForegroundColor Red
-Write-Host "  Ce script va effectuer un scan reseau actif (Nmap)." -ForegroundColor Yellow
-Write-Host "  Assure-toi d'avoir les autorisations necessaires." -ForegroundColor Yellow
-Write-Host "  Le scan peut declencher des alertes sur les equipements sensibles" -ForegroundColor Yellow
-Write-Host '  (firewalls, IDS/IPS, equipements reseau, systemes industriels OT/ICS).' -ForegroundColor Yellow
-Write-Host ""
 
-if (-not (Confirm-Action "Confirmes-tu avoir les droits pour scanner ce reseau ?" "Red")) {
+if (-not (Demander_OuiNon "Confirmes-tu avoir les droits pour scanner ce reseau ?" "Red")) {
     Write-Host "Scan annule." -ForegroundColor DarkGray
+    if ($transcriptActif) { try { Stop-Transcript | Out-Null } catch {} }
     exit 0
 }
 
-# Saisie des plages reseau
+# ─── SAISIE DES PLAGES ──────────────────────────────────────
 Write-Host ""
-Write-Host "Entrez les plages reseau a scanner (une par ligne, ligne vide pour terminer)." -ForegroundColor Cyan
-Write-Host '  Formats acceptes : 192.168.1.0/24  ou  10.0.0.1-50  ou  192.168.1.5' -ForegroundColor DarkGray
+Write-Host "Plages reseau a scanner (une par ligne, ligne vide pour terminer)." -ForegroundColor Cyan
+Write-Host "  Formats : 192.168.1.0/24  ou  10.0.0.1-50  ou  192.168.1.5" -ForegroundColor DarkGray
 Write-Host ""
 
-$ranges = [System.Collections.Generic.List[string]]::new()
+$plages = [System.Collections.Generic.List[string]]::new()
 while ($true) {
-    Write-Host "  Plage $($ranges.Count + 1) : " -ForegroundColor Yellow -NoNewline
-    $input = Read-Host
-    if ([string]::IsNullOrWhiteSpace($input)) {
-        if ($ranges.Count -eq 0) {
-            Write-Host "  Au moins une plage est requise." -ForegroundColor Red
-            continue
-        }
+    Write-Host "  Plage $($plages.Count + 1) : " -ForegroundColor Yellow -NoNewline
+    $saisie = Read-Host
+    if ([string]::IsNullOrWhiteSpace($saisie)) {
+        if ($plages.Count -eq 0) { Write-Host "  Au moins une plage requise." -ForegroundColor Red; continue }
         break
     }
-    $ranges.Add($input.Trim())
+    $plages.Add($saisie.Trim())
 }
+$plagesArr = @($plages)   # tableau pour splatting
 
 Write-Host ""
 Write-Host "  Plages a scanner :" -ForegroundColor Cyan
-$ranges | ForEach-Object { Write-Host "    - $_" -ForegroundColor White }
+$plagesArr | ForEach-Object { Write-Host "    - $_" -ForegroundColor White }
 
-# Etape 0 : Nmap
-$nmapExe = Get-NmapExe
+# ─── ETAPE 0 : NMAP + NPCAP ─────────────────────────────────
+Write-Host ""
+Write-Host "------------------------------------------------------------" -ForegroundColor Cyan
+Write-Host "  ETAPE 0 : Verification Nmap et Npcap" -ForegroundColor Cyan
+Write-Host "------------------------------------------------------------" -ForegroundColor Cyan
 
-# Etape 1 : Hosts up
-$hostsUp = Invoke-Step1-HostDiscovery -NmapExe $nmapExe -Ranges $ranges
+$nmapExe = Trouver_Nmap
+if (-not $nmapExe) { if ($transcriptActif) { try { Stop-Transcript | Out-Null } catch {} }; exit 1 }
+if (-not (Verifier_Npcap)) { if ($transcriptActif) { try { Stop-Transcript | Out-Null } catch {} }; exit 1 }
 
-if (-not $hostsUp -or $hostsUp.Count -eq 0) {
-    Write-Host "Aucun hote actif trouve sur les plages specifiees. Fin du script." -ForegroundColor Yellow
+# ─── ETAPE 1 : DECOUVERTE DES HOTES (une passe) ─────────────
+Write-Host ""
+Write-Host "------------------------------------------------------------" -ForegroundColor Cyan
+Write-Host "  ETAPE 1 : Decouverte des hotes actifs" -ForegroundColor Cyan
+Write-Host "------------------------------------------------------------" -ForegroundColor Cyan
+
+# -sn : pas de scan de ports. Sur le meme sous-reseau Nmap fait de l'ARP automatiquement ;
+# ailleurs, les sondes ICMP echo/timestamp + TCP SYN/ACK couvrent les hotes derriere routeur.
+$argsDecouverte = @("-sn","-T4","-R","-PE","-PP","-PS21,22,80,135,139,443,445,3389,5985","-PA80,443,3389") + $plagesArr
+$fxml = Invoke-Nmap -NmapExe $nmapExe -Arguments $argsDecouverte -XmlOut $xmlDiscovery -Libelle "Decouverte (ICMP + TCP + ARP)"
+
+$hotes = Lire_XmlNmap -Fichier $fxml | Where-Object { $_.Etat -eq 'up' }
+Ecrire_Log "Hotes actifs : $($hotes.Count)"
+Write-Host "  $($hotes.Count) hote(s) actif(s)" -ForegroundColor Green
+$hotes | ForEach-Object { Write-Host "    - $($_.IP)  $($_.Hostname)" -ForegroundColor DarkCyan }
+
+if ($hotes.Count -eq 0) {
+    Write-Host "Aucun hote detecte. Fin du scan." -ForegroundColor Yellow
+    if ($transcriptActif) { try { Stop-Transcript | Out-Null } catch {} }
     exit 0
 }
 
-# Etape 2 : Identification serveurs
-$servers = Invoke-Step2-ServerIdentification -NmapExe $nmapExe -Hosts $hostsUp
+$ipList = @($hotes | Select-Object -ExpandProperty IP)
 
-if (-not $servers -or $servers.Count -eq 0) {
-    Write-Host "Aucun serveur identifie parmi les hotes actifs. Fin du script." -ForegroundColor Yellow
-    exit 0
+# ─── ETAPE 2 : PORTS + DETECTION OS ─────────────────────────
+Write-Host ""
+Write-Host "------------------------------------------------------------" -ForegroundColor Cyan
+Write-Host "  ETAPE 2 : Scan de ports et detection OS" -ForegroundColor Cyan
+Write-Host "------------------------------------------------------------" -ForegroundColor Cyan
+
+# 2a. Scan de ports cles (donne a -O de la matiere, et sert au typage Windows/Linux)
+$portsCles = "22,135,139,445,3389,5985,5986"
+$argsPorts = @("-sS","-T4","-Pn","-p",$portsCles,"--open") + $ipList
+$fxmlPorts = Invoke-Nmap -NmapExe $nmapExe -Arguments $argsPorts -XmlOut $xmlPorts -Libelle "Scan de ports ($portsCles)"
+$infosPorts = Lire_XmlNmap -Fichier $fxmlPorts
+
+# 2b. Detection OS, etape separee comme demande. -Pn : hotes deja confirmes up.
+$argsOS = @("-O","--osscan-guess","-T4","-Pn","--max-os-tries","1") + $ipList
+$fxmlOS = Invoke-Nmap -NmapExe $nmapExe -Arguments $argsOS -XmlOut $xmlOS -Libelle "Detection OS (-O)"
+$infosOS = Lire_XmlNmap -Fichier $fxmlOS
+
+# ─── FUSION ─────────────────────────────────────────────────
+function Typer_Systeme {
+    param([string]$Os, [int[]]$Ports)
+    if ($Os -match "Windows")                               { return "Windows" }
+    if ($Os -match "Linux|Ubuntu|Debian|CentOS|Red Hat|RHEL|Unix") { return "Linux" }
+    if ($Ports -contains 5985 -or $Ports -contains 5986 -or $Ports -contains 445 -or $Ports -contains 3389 -or $Ports -contains 135) { return "Windows" }
+    if ($Ports -contains 22)                                { return "Linux" }
+    return "Inconnu"
+}
+
+$serveurs = [System.Collections.Generic.List[object]]::new()
+foreach ($h in $hotes) {
+    $pInfo = $infosPorts | Where-Object { $_.IP -eq $h.IP } | Select-Object -First 1
+    $oInfo = $infosOS    | Where-Object { $_.IP -eq $h.IP } | Select-Object -First 1
+
+    $ports = @()
+    if ($pInfo) { $ports = @($pInfo.Ports | Select-Object -ExpandProperty Port) }
+
+    $os = "Inconnu"; $prec = $null
+    if ($oInfo -and $oInfo.OS -ne "Inconnu") { $os = $oInfo.OS; $prec = $oInfo.Precision }
+
+    # Nom : privilegier un FQDN resolu lors du scan de ports/OS s'il est plus precis
+    $nom = $h.Hostname
+    foreach ($src in @($pInfo, $oInfo)) {
+        if ($src -and $src.Hostname -and $src.Hostname -ne $src.IP -and $nom -eq $h.IP) { $nom = $src.Hostname }
+    }
+
+    $type = Typer_Systeme -Os $os -Ports $ports
+
+    $serveurs.Add([PSCustomObject]@{
+        Hostname   = $nom
+        IP         = $h.IP
+        OS         = $os
+        PrecisionOS= $prec
+        Type       = $type
+        Ports      = ($ports | Sort-Object -Unique)
+        WinRM      = ($ports -contains 5985 -or $ports -contains 5986)
+        SSH        = ($ports -contains 22)
+        SMB        = ($ports -contains 445)
+        Methode    = ""
+        Skip       = "Non"
+        SkipRaison = ""
+    })
 }
 
 Write-Host ""
-Write-Host "  $($servers.Count) serveur(s) identifie(s)." -ForegroundColor Green
-
-# Etape 3 : Test WinRM
-$servers = Invoke-Step3-WinRMCheck -NmapExe $nmapExe -Servers $servers
-
-# Etape 4 : Validation utilisateur
-$targets = Invoke-Step4-UserValidation -Servers $servers
-
-if (-not $targets -or $targets.Count -eq 0) {
-    Write-Host "Aucune cible retenue. Fin du script." -ForegroundColor Yellow
-    exit 0
+Write-Host "  $($serveurs.Count) systeme(s) identifie(s) :" -ForegroundColor Green
+$serveurs | ForEach-Object {
+    $couleur = if ($_.Type -eq "Windows") { "Cyan" } elseif ($_.Type -eq "Linux") { "Green" } else { "Yellow" }
+    $precTxt = if ($_.PrecisionOS) { " (~$($_.PrecisionOS)%)" } else { "" }
+    Write-Host "    - $($_.IP) [$($_.Type)] $($_.OS)$precTxt  ports: $($_.Ports -join ',')" -ForegroundColor $couleur
 }
 
-# Etape 5 : Export + Audit distant
-Invoke-Step5-AuditRemote -Targets $targets
+# ─── ETAPE 3 : VALIDATION UTILISATEUR ───────────────────────
+Write-Host ""
+Write-Host "------------------------------------------------------------" -ForegroundColor Cyan
+Write-Host "  ETAPE 3 : Validation des cibles" -ForegroundColor Cyan
+Write-Host "------------------------------------------------------------" -ForegroundColor Cyan
+
+foreach ($srv in $serveurs) {
+    Write-Host ""
+    Write-Host "  +-- $($srv.IP) [$($srv.Type)] ------------------" -ForegroundColor Cyan
+    Write-Host "  |  Hostname : $($srv.Hostname)" -ForegroundColor White
+    Write-Host "  |  OS       : $($srv.OS)" -ForegroundColor White
+    Write-Host "  |  WinRM    : $(if ($srv.WinRM) {'OUI'} else {'NON'})" -ForegroundColor $(if ($srv.WinRM) {"Green"} else {"DarkGray"})
+    Write-Host "  |  SSH      : $(if ($srv.SSH) {'OUI'} else {'NON'})" -ForegroundColor $(if ($srv.SSH) {"Green"} else {"DarkGray"})
+    Write-Host "  |  SMB(445) : $(if ($srv.SMB) {'OUI'} else {'NON'})" -ForegroundColor $(if ($srv.SMB) {"Green"} else {"DarkGray"})
+    Write-Host "  +-----------------------------------------------" -ForegroundColor Cyan
+
+    # Methode d'audit retenue, par ordre de preference
+    if     ($srv.WinRM)                            { $srv.Methode = "WinRM"  }
+    elseif ($srv.SSH -and $srv.Type -eq "Linux")   { $srv.Methode = "SSH"    }
+    elseif ($srv.SMB -and $srv.Type -eq "Windows") { $srv.Methode = "PsExec" }
+    elseif ($srv.SSH)                              { $srv.Methode = "SSH"    }
+
+    if (-not $srv.Methode) {
+        if (Demander_OuiNon "  Inclure dans le CSV (sans audit distant) ?") { $srv.Skip = "Non" }
+        else { $srv.Skip = "Ignorer" }
+        $srv.SkipRaison = "Aucun acces (ni WinRM, ni SSH, ni SMB)"
+    } else {
+        if ($srv.Methode -eq "PsExec") {
+            Write-Host "  Pas de WinRM - audit via PsExec (SMB/445, compte Domain Admin, sans GPO)." -ForegroundColor Yellow
+        }
+        if (-not (Demander_OuiNon "  Auditer ce systeme ?")) {
+            $srv.Skip = "Oui"
+            Write-Host "  Raison du skip : " -ForegroundColor DarkGray -NoNewline
+            $srv.SkipRaison = Read-Host
+            if (-not $srv.SkipRaison) { $srv.SkipRaison = "Skippe manuellement" }
+        }
+    }
+}
+
+# ─── AUDIT DISTANT WINDOWS ──────────────────────────────────
+function Audit_Windows {
+    param([object]$Cible)
+
+    Write-Host ""
+    Write-Host "  >> Audit Windows : $($Cible.IP) ($($Cible.Hostname))" -ForegroundColor Cyan
+
+    $trusted = (Get-Item WSMan:\localhost\Client\TrustedHosts -ErrorAction SilentlyContinue).Value
+    if ($trusted -ne "*" -and $trusted -notmatch [regex]::Escape($Cible.IP)) {
+        $nouveau = if ($trusted) { "$trusted,$($Cible.IP)" } else { $Cible.IP }
+        Set-Item WSMan:\localhost\Client\TrustedHosts -Value $nouveau -Force -ErrorAction SilentlyContinue
+    }
+
+    $domaineCourant = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).Domain
+    $cibleConnexion = $Cible.IP
+    if ($Cible.Hostname -ne $Cible.IP -and $Cible.Hostname -match "\.") { $cibleConnexion = $Cible.Hostname }
+
+    $params = @{}
+    $horsDomaineOuIP = ($Cible.Hostname -eq $Cible.IP) -or (-not $domaineCourant) -or
+                       ($Cible.Hostname -notmatch [regex]::Escape($domaineCourant))
+    if ($horsDomaineOuIP) {
+        Write-Host "  Machine hors domaine - credentials requis." -ForegroundColor Yellow
+        try { $params["Credential"] = Get-Credential -Message "Credentials pour $($Cible.Hostname) ($($Cible.IP))" }
+        catch { Write-Warning "Credentials annules - $($Cible.IP) ignore."; return }
+    }
+
+    $session = $null
+    try {
+        $session = New-PSSession -ComputerName $cibleConnexion @params -ErrorAction Stop
+
+        # Les memes sous-dossiers que main.ps1, NTFS inclus
+        $sousDossiers = @("Comptes","AD","HV","VM","NTFS")
+        $dossierTemp  = "C:\Windows\Temp\Audit_$runId"
+        Invoke-Command -Session $session -ScriptBlock {
+            param($dir, $subs)
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            foreach ($sub in $subs) { New-Item -ItemType Directory -Force -Path (Join-Path $dir $sub) | Out-Null }
+        } -ArgumentList $dossierTemp, $sousDossiers
+
+        # Role de la cible (Get-WindowsFeature n'existe que sur Windows Server)
+        $infos = Invoke-Command -Session $session -ScriptBlock {
+            $os = (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption
+            $roles = @()
+            if (Get-Command Get-WindowsFeature -ErrorAction SilentlyContinue) {
+                try { $roles = (Get-WindowsFeature | Where-Object InstallState -eq Installed).Name } catch {}
+            }
+            [PSCustomObject]@{ OS = $os; Roles = $roles -join "," }
+        }
+        $estDC     = $infos.Roles -split "," -contains "AD-Domain-Services"
+        $estHyperV = $infos.Roles -split "," -contains "Hyper-V"
+
+        # Scripts a NE PAS copier.
+        # NTFS et GPO restent : un serveur de fichiers (non-DC) heberge justement les partages,
+        # et GPO se skippe proprement seul si le module manque. On exclut ce qui est purement local
+        # a l'orchestrateur (00_), interactif cloud (12_ M365) ou dependant d'un role precis.
+        $exclure = @("^_", "^00_", "^12_Audit_Comptes_365", "^23_Audit_Linux")   # "^_" : scripts desactives
+        # Hors DC : modules ne collectant que des donnees du domaine (evite les doublons par serveur)
+        if (-not $estDC)     { $exclure += @("^13_Arborescence", "^14_Audit_PSO", "^15_Audit_Silos", "^30_Audit_Replication", "^33_Audit_Groupes") }
+        if (-not $estHyperV) { $exclure += "^20_Audit_Hyperviseurs" }
+
+        $psDir = Join-Path $root "Scripts\PowerShell"
+        $scriptsWinRM = Get-ChildItem $psDir -Filter "*.ps1" |
+            Where-Object { $nom = $_.Name; -not ($exclure | Where-Object { $nom -match $_ }) } |
+            Sort-Object Name
+
+        $role = if ($estDC) { "DC/AD" } elseif ($estHyperV) { "Hyper-V" } else { "Membre/Standalone" }
+        Write-Host "  Role : $role | Scripts : $($scriptsWinRM.Count)" -ForegroundColor DarkGray
+
+        foreach ($s in $scriptsWinRM) {
+            Copy-Item -Path $s.FullName -Destination $dossierTemp -ToSession $session -Force
+            Write-Host "    - $($s.Name)" -ForegroundColor DarkCyan
+            Invoke-Command -Session $session -ScriptBlock {
+                param($script, $csvDir)
+                $env:AUDIT_TEMP_CSV     = $csvDir
+                $env:AUDIT_TEMP_COMPTES = Join-Path $csvDir "Comptes"
+                $env:AUDIT_TEMP_AD      = Join-Path $csvDir "AD"
+                $env:AUDIT_TEMP_HV      = Join-Path $csvDir "HV"
+                $env:AUDIT_TEMP_VM      = Join-Path $csvDir "VM"
+                $env:AUDIT_TEMP_NTFS    = Join-Path $csvDir "NTFS"
+                $env:AUDIT_NONINTERACTIVE = "1"   # pas de Read-Host a distance
+                try { & $script } catch { Write-Warning "Erreur $_" }
+            } -ArgumentList (Join-Path $dossierTemp $s.Name), $dossierTemp -ErrorAction SilentlyContinue
+        }
+
+        # Rapatriement : tous les fichiers produits (csv ET txt/html NTFS), en conservant
+        # le sous-dossier d'origine pour que Process_excels retrouve chaque module.
+        $destLocal = Join-Path $tempCsv $Cible.Hostname
+        New-Item -ItemType Directory -Force -Path $destLocal | Out-Null
+        foreach ($sub in $sousDossiers) {
+            New-Item -ItemType Directory -Force -Path (Join-Path $destLocal $sub) | Out-Null
+        }
+
+        $fichiersDistants = Invoke-Command -Session $session -ScriptBlock {
+            param($dir)
+            Get-ChildItem $dir -File -Recurse -Include *.csv,*.txt,*.html -ErrorAction SilentlyContinue |
+                ForEach-Object { [PSCustomObject]@{ Full = $_.FullName; Rel = $_.FullName.Substring($dir.Length).TrimStart('\') } }
+        } -ArgumentList $dossierTemp
+
+        $nbCopies = 0
+        foreach ($f in $fichiersDistants) {
+            $destination = Join-Path $destLocal $f.Rel
+            New-Item -ItemType Directory -Force -Path (Split-Path $destination) | Out-Null
+            Copy-Item -Path $f.Full -Destination $destination -FromSession $session -Force
+            Write-Host "    <- $($f.Rel)" -ForegroundColor Green
+            $nbCopies++
+        }
+        Write-Host "  $nbCopies fichier(s) rapatrie(s) dans $destLocal" -ForegroundColor Green
+
+        Invoke-Command -Session $session -ScriptBlock {
+            param($dir) Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+        } -ArgumentList $dossierTemp
+
+        Write-Host "  << $($Cible.IP) termine." -ForegroundColor Green
+    } catch {
+        Write-Warning "Connexion WinRM echouee sur $($Cible.IP) : $_"
+    } finally {
+        if ($session) { Remove-PSSession $session -ErrorAction SilentlyContinue }
+    }
+}
+
+# ─── AUDIT DISTANT LINUX ────────────────────────────────────
+function Audit_Linux {
+    param([object]$Cible)
+
+    Write-Host ""
+    Write-Host "  >> Audit Linux : $($Cible.IP) ($($Cible.Hostname))" -ForegroundColor Green
+
+    $sshExe = Trouver_SSH
+    if (-not $sshExe) { Write-Warning "SSH non disponible - $($Cible.IP) ignore."; return }
+
+    Write-Host "  Utilisateur SSH pour $($Cible.IP) : " -ForegroundColor Yellow -NoNewline
+    $sshUser = Read-Host
+    Write-Host "  Mot de passe : " -ForegroundColor Yellow -NoNewline
+    $sshPassSecure = Read-Host -AsSecureString
+    $sshPass = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
+        [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($sshPassSecure))
+
+    $cmdH = "echo '=HOSTNAME=' && hostname"
+    $cmdO = "echo '=OS=' && cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d= -f2"
+    $cmdI = "echo '=INTERFACES=' && ip addr show 2>/dev/null | grep -E 'inet |^[0-9]+:' || ifconfig 2>/dev/null"
+    $cmdU = 'echo "=USERS=" && getent passwd | awk -F: ' + "'" + '$3>=1000 && $7!~/nologin|false|sync/{print $1","$3","$6}' + "'"
+    $cmdS = 'echo "=SERVICES=" && systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null | awk ' + "'" + '{print $1}' + "'" + ' | head -30'
+    $scriptSSH = "$cmdH && $cmdO && $cmdI && $cmdU && $cmdS"
+
+    $sortie = $null
+    try {
+        if ($sshExe -match "plink") {
+            $sortie = & $sshExe -ssh -l $sshUser -pw $sshPass -batch -o "StrictHostKeyChecking=no" $Cible.IP $scriptSSH 2>&1
+        } else {
+            $env:SSH_ASKPASS = ""
+            $sortie = & $sshExe -o "StrictHostKeyChecking=no" -o "ConnectTimeout=10" "${sshUser}@$($Cible.IP)" $scriptSSH 2>&1
+        }
+    } catch {
+        Write-Warning "Connexion SSH echouee sur $($Cible.IP) : $_"
+        return
+    }
+
+    $hostname = ""; $os = ""; $section = ""
+    $interfaces = [System.Collections.Generic.List[string]]::new()
+    $utilisateurs = [System.Collections.Generic.List[string]]::new()
+    $services = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($ligne in $sortie) {
+        switch -Regex ($ligne) {
+            "^=HOSTNAME="   { $section = "hostname"; continue }
+            "^=OS="         { $section = "os"; continue }
+            "^=INTERFACES=" { $section = "interfaces"; continue }
+            "^=USERS="      { $section = "users"; continue }
+            "^=SERVICES="   { $section = "services"; continue }
+            default {
+                if ([string]::IsNullOrWhiteSpace($ligne)) { continue }
+                switch ($section) {
+                    "hostname"   { $hostname = $ligne.Trim() }
+                    "os"         { $os       = $ligne.Trim() }
+                    "interfaces" { $interfaces.Add($ligne.Trim()) }
+                    "users"      { $utilisateurs.Add($ligne.Trim()) }
+                    "services"   { $services.Add($ligne.Trim()) }
+                }
+            }
+        }
+    }
+
+    $destLocal = Join-Path $tempCsv $Cible.Hostname
+    New-Item -ItemType Directory -Force -Path $destLocal | Out-Null
+    $exportFile = Join-Path $destLocal "$($Cible.Hostname)_Audit_Linux.csv"
+
+    [PSCustomObject]@{
+        Hostname     = if ($hostname) { $hostname } else { $Cible.Hostname }
+        IP           = $Cible.IP
+        OS           = $os
+        Interfaces   = $interfaces -join " | "
+        Utilisateurs = $utilisateurs -join " | "
+        Services     = $services -join " | "
+    } | Export-Csv -Path $exportFile -NoTypeInformation -Encoding UTF8
+
+    Write-Host "  << $($Cible.IP) termine - CSV : $(Split-Path $exportFile -Leaf)" -ForegroundColor Green
+}
+
+# ─── PSEXEC (acquis par init.ps1 ; ici on le localise seulement) ─
+function Trouver_PsExec {
+    $candidats = @(
+        (Join-Path $root "Tools\PsExec64.exe"),
+        (Join-Path $root "Tools\PsExec.exe"),
+        (Join-Path $root "Tools\PsTools\PsExec64.exe"),
+        (Join-Path $root "Tools\PsTools\PsExec.exe")
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+    if (-not $candidats) {
+        $candidats = Get-Command PsExec64.exe, PsExec.exe -ErrorAction SilentlyContinue |
+                     Select-Object -First 1 -ExpandProperty Source
+    }
+    if ($candidats) { Write-Host "  PsExec : $candidats" -ForegroundColor Green; return $candidats }
+
+    Write-Warning "PsExec introuvable - relancer init.ps1 ou placer PsExec64.exe dans Tools\"
+    return $null
+}
+
+# Audit distant SANS WinRM : copie des scripts via C$ (SMB/445), execution par PsExec (SYSTEM),
+# rapatriement par sous-dossier (Comptes/AD/HV/VM/NTFS) comme la voie WinRM.
+# Scripts executes (seulement) : comptes, comptes T0, et VM (serveur) ou Workstation (poste).
+function Audit_Windows_PsExec {
+    param([object]$Cible)
+
+    Write-Host ""
+    Write-Host "  >> Audit Windows (PsExec/SMB) : $($Cible.IP) ($($Cible.Hostname))" -ForegroundColor Cyan
+
+    $psexec = Trouver_PsExec
+    if (-not $psexec) { Write-Warning "PsExec indisponible - $($Cible.IP) ignore."; return }
+
+    # Compte administrateur du DOMAINE (format DOMAINE\compte). 445 etant deja ouvert,
+    # aucune GPO n'est requise : les partages admin C$/ADMIN$ sont accessibles au Domain Admin.
+    Write-Host "  Compte administrateur du domaine requis (format DOMAINE\compte) :" -ForegroundColor Yellow
+    try { $cred = Get-Credential -Message "Administrateur du domaine pour $($Cible.IP)" }
+    catch { Write-Warning "Credentials annules - $($Cible.IP) ignore."; return }
+    $credUser = $cred.UserName
+    $credPass = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                    [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($cred.Password))
+
+    # Serveur vs poste : DomainRole via DCOM (135) si possible, sinon chaine OS Nmap.
+    # 0,1 = poste ; 2,3 = serveur membre/standalone ; 4,5 = controleur de domaine.
+    $estServeur = $false
+    if ($Cible.Ports -contains 135) {
+        try {
+            $cimTmp = New-CimSession -ComputerName $Cible.IP -Credential $cred `
+                      -SessionOption (New-CimSessionOption -Protocol Dcom) -ErrorAction Stop
+            $dr = (Get-CimInstance -CimSession $cimTmp -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue).DomainRole
+            Remove-CimSession $cimTmp
+            if ($null -ne $dr) { $estServeur = ([int]$dr -ge 2) }
+        } catch {}
+    }
+    if (-not $estServeur -and $Cible.OS -match "Server") { $estServeur = $true }
+
+    $scriptsVoulus = @("11_Audit_comptes.ps1")
+    if ($estServeur) {
+        $scriptsVoulus += @("10_Audit_comptes_T0.ps1", "21_Audit_VMs.ps1")
+    } else {
+        $scriptsVoulus += "22_Audit_Workstation.ps1"
+    }
+
+    $psDir = Join-Path $root "Scripts\PowerShell"
+    $scriptsDispo = Get-ChildItem $psDir -Filter "*.ps1" -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -in $scriptsVoulus } | Sort-Object Name
+    if (-not $scriptsDispo) {
+        Write-Warning "  Aucun des scripts attendus trouve dans $psDir"
+        return
+    }
+    Write-Host "  Role : $(if ($estServeur){'Serveur/DC'}else{'Poste'}) | Scripts : $($scriptsDispo.Count)" -ForegroundColor DarkGray
+
+    # Acces au partage admin C$ (SMB/445)
+    $nomDrive = "PSAUD_$($Cible.IP -replace '\.','_')"
+    try {
+        New-PSDrive -Name $nomDrive -PSProvider FileSystem -Root "\\$($Cible.IP)\C$" -Credential $cred -ErrorAction Stop | Out-Null
+    } catch {
+        Write-Warning "Acces \\$($Cible.IP)\C$ echoue (SMB/445) : $_"
+        return
+    }
+
+    $sousDossiers = @("Comptes","AD","HV","VM","NTFS")
+    $dossierCible = "C:\Windows\Temp\Audit_$runId"                   # vu depuis la cible
+    $dossierUNC   = "${nomDrive}:\Windows\Temp\Audit_$runId"         # vu depuis nous
+    foreach ($sub in @("") + $sousDossiers) {
+        New-Item -ItemType Directory -Force -Path (Join-Path $dossierUNC $sub) | Out-Null
+    }
+
+    # Wrapper : memes variables d'env que la voie WinRM + mode non interactif
+    $ntfsLine = if ($env:AUDIT_NTFS_PATHS) { "`$env:AUDIT_NTFS_PATHS = '$($env:AUDIT_NTFS_PATHS)'" } else { "" }
+    $wrapper = @"
+`$ErrorActionPreference = 'Continue'
+`$dir = `$PSScriptRoot
+`$env:AUDIT_TEMP_CSV       = `$dir
+`$env:AUDIT_TEMP_COMPTES   = Join-Path `$dir 'Comptes'
+`$env:AUDIT_TEMP_AD        = Join-Path `$dir 'AD'
+`$env:AUDIT_TEMP_HV        = Join-Path `$dir 'HV'
+`$env:AUDIT_TEMP_VM        = Join-Path `$dir 'VM'
+`$env:AUDIT_TEMP_NTFS      = Join-Path `$dir 'NTFS'
+`$env:AUDIT_NONINTERACTIVE = '1'
+$ntfsLine
+Get-ChildItem `$dir -Filter '*.ps1' | Where-Object { `$_.Name -ne '_run_audit.ps1' } | Sort-Object Name | ForEach-Object {
+    try { & `$_.FullName } catch { Write-Warning "Erreur `$(`$_.Name) : `$_" }
+}
+"@
+    Set-Content -Path (Join-Path $dossierUNC "_run_audit.ps1") -Value $wrapper -Encoding UTF8
+
+    foreach ($sfile in $scriptsDispo) {
+        Copy-Item -Path $sfile.FullName -Destination $dossierUNC -Force
+        Write-Host "    - $($sfile.Name)" -ForegroundColor DarkCyan
+    }
+
+    # Execution : PsExec synchrone, en SYSTEM, token eleve
+    Write-Host "  PsExec : execution en cours sur la cible (SYSTEM)..." -ForegroundColor DarkGray
+    $psArgs = @(
+        "\\$($Cible.IP)", "-accepteula", "-nobanner", "-s", "-h",
+        "-u", $credUser, "-p", $credPass, "-w", $dossierCible,
+        "powershell.exe", "-ExecutionPolicy", "Bypass", "-NonInteractive",
+        "-WindowStyle", "Hidden", "-File", "$dossierCible\_run_audit.ps1"
+    )
+    $errLog = Join-Path $recoDir "psexec_$($Cible.IP).log"
+    $proc = Start-Process -FilePath $psexec -ArgumentList $psArgs -NoNewWindow -Wait -PassThru -RedirectStandardError $errLog
+    if ($proc.ExitCode -notin @(0,1)) {
+        Write-Warning "  PsExec code $($proc.ExitCode) sur $($Cible.IP) - voir $errLog"
+    }
+
+    # Rapatriement par sous-dossier (conserve Comptes/AD/HV/VM/NTFS)
+    $destLocal = Join-Path $tempCsv $Cible.Hostname
+    New-Item -ItemType Directory -Force -Path $destLocal | Out-Null
+    foreach ($sub in $sousDossiers) { New-Item -ItemType Directory -Force -Path (Join-Path $destLocal $sub) | Out-Null }
+
+    $fichiers = Get-ChildItem $dossierUNC -File -Recurse -Include *.csv,*.txt,*.html -ErrorAction SilentlyContinue
+    $nb = 0
+    foreach ($f in $fichiers) {
+        $rel = $f.FullName.Substring(((Resolve-Path $dossierUNC).Path).Length).TrimStart('\')
+        $destination = Join-Path $destLocal $rel
+        New-Item -ItemType Directory -Force -Path (Split-Path $destination) | Out-Null
+        Copy-Item -Path $f.FullName -Destination $destination -Force
+        Write-Host "    <- $rel" -ForegroundColor Green
+        $nb++
+    }
+    if ($nb -eq 0) { Write-Warning "  Aucun fichier genere (droits insuffisants ou scripts sans resultat)." }
+    else { Write-Host "  $nb fichier(s) rapatrie(s) dans $destLocal" -ForegroundColor Green }
+
+    # Nettoyage
+    Remove-Item $dossierUNC -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-PSDrive $nomDrive -Force -ErrorAction SilentlyContinue
+    Write-Host "  << $($Cible.IP) termine." -ForegroundColor Green
+}
+
+# ─── ETAPE 4 : EXPORT CSV + AUDIT DISTANT ───────────────────
+Write-Host ""
+Write-Host "------------------------------------------------------------" -ForegroundColor Cyan
+Write-Host "  ETAPE 4 : Export CSV et audit des cibles" -ForegroundColor Cyan
+Write-Host "------------------------------------------------------------" -ForegroundColor Cyan
+
+$serveurs | Where-Object { $_.Skip -ne "Ignorer" } |
+    Select-Object Hostname, IP, OS, PrecisionOS, Type,
+                  @{N="Ports";E={ $_.Ports -join " " }}, WinRM, SSH, SMB, Methode, Skip, SkipRaison |
+    Export-Csv -Path $csvResultat -NoTypeInformation -Encoding UTF8
+Write-Host "  CSV reconnaissance : $csvResultat" -ForegroundColor Green
+
+$ipsLocales = @(
+    [System.Net.Dns]::GetHostAddresses([System.Net.Dns]::GetHostName()) |
+    Where-Object { $_.AddressFamily -eq "InterNetwork" } | ForEach-Object { $_.ToString() }
+)
+
+$cibles = $serveurs | Where-Object { $_.Skip -eq "Non" -and $_.IP -notin $ipsLocales -and $_.Methode }
+
+Write-Host "  Cibles qualifiees pour audit : $(@($cibles).Count)" -ForegroundColor DarkGray
+if (-not $cibles -or @($cibles).Count -eq 0) {
+    Write-Host "  Aucune cible a auditer." -ForegroundColor Yellow
+} else {
+    foreach ($cible in $cibles) {
+        switch ($cible.Methode) {
+            "WinRM"  { Audit_Windows        -Cible $cible }
+            "SSH"    { Audit_Linux          -Cible $cible }
+            "PsExec" { Audit_Windows_PsExec -Cible $cible }
+        }
+    }
+}
+
+if ($script:NmapInstallePourReparation) { Desinstaller_Nmap }
 
 Write-Host ""
-Write-Host ("-" * 60) -ForegroundColor Magenta
+Write-Host "------------------------------------------------------------" -ForegroundColor Magenta
 Write-Host "  RECONNAISSANCE TERMINEE" -ForegroundColor Magenta
-Write-Host "  Logs     : $recoDir" -ForegroundColor DarkGray
-Write-Host "  CSV      : $csvResults" -ForegroundColor DarkGray
-Write-Host ("-" * 60) -ForegroundColor Magenta
+Write-Host "  Logs : $recoDir" -ForegroundColor DarkGray
+Write-Host "  CSV  : $csvResultat" -ForegroundColor DarkGray
+Write-Host "------------------------------------------------------------" -ForegroundColor Magenta
+
+if ($transcriptActif) { try { Stop-Transcript | Out-Null } catch {} }

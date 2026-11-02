@@ -1,3 +1,7 @@
+# TemplateAuditVM.py
+# Version      : 1.1
+# Derniere modif : Colonnes NTP (NTP Type, NTP Serveur(s), NTP Source)
+# Role         : Genere Template_Audit_VMs.xlsx (feuilles VMs et Referentiels)
 import os
 
 # Repertoire de sortie :
@@ -42,7 +46,11 @@ headers = [
     "Diag HV/KVP",      # L
     "Replication",      # M
     "Dest replication", # N
-    "Windows Active"    # O
+    "Windows Active",   # O
+    "Roles FSMO",       # P
+    "NTP Type",         # Q
+    "NTP Serveur(s)",   # R
+    "NTP Source"        # S
 ]
 
 for col, header in enumerate(headers, start=1):
@@ -52,7 +60,7 @@ for col, header in enumerate(headers, start=1):
     cell.alignment = Alignment(horizontal="center", vertical="center")
     ws.column_dimensions[chr(64+col)].width = 25
 
-table = Table(displayName="Table_VMs", ref="A1:O20")
+table = Table(displayName="Table_VMs", ref=f"A1:{chr(64+len(headers))}20")
 style = TableStyleInfo(
     name="TableStyleMedium9", showFirstColumn=False,
     showLastColumn=False, showRowStripes=True, showColumnStripes=False)

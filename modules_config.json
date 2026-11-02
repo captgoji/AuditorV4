@@ -19,11 +19,20 @@
       "header_map": {}
     },
     {
+      "name": "workstation",
+      "template": "Templates_Excel/Template_Audit_Workstation.xlsx",
+      "out_file": "Excel/Audit_Workstation.xlsx",
+      "sheet": "Workstations",
+      "csv_glob": "Temp_CSV/VM/*Audit_Workstation.csv",
+      "start_row": 1,
+      "header_map": {}
+    },
+    {
       "name": "replication",
       "template": "Templates_Excel/Template_Audit_Replication.xlsx",
       "out_file": "Excel/Audit_Replication.xlsx",
       "sheet": "Replication",
-      "csv_glob": "Temp_CSV/VM/*Audit_Replication.csv",
+      "csv_glob": "Temp_CSV/AD/*Audit_Replication.csv",
       "start_row": 1,
       "header_map": {}
     },
@@ -34,7 +43,8 @@
       "sheet": "Comptes",
       "csv_glob": "Temp_CSV/Comptes/*Audit_comptes_T0.csv",
       "start_row": 1,
-      "header_map": {}
+      "header_map": {},
+      "classeur": "{host}_Audit_Comptes"
     },
     {
       "name": "comptes",
@@ -43,20 +53,22 @@
       "sheet": "Comptes",
       "csv_glob": "Temp_CSV/Comptes/*Audit_comptes.csv",
       "start_row": 1,
-      "header_map": {}
+      "header_map": {},
+      "classeur": "{host}_Audit_Comptes"
     },
     {
       "name": "comptes_365",
       "template": "Templates_Excel/Template_Audit_Comptes.xlsx",
       "out_file": "Excel/Audit_Comptes_M365.xlsx",
       "sheet": "Comptes",
-      "csv_glob": "Temp_CSV/Comptes/M365_Users_Audit.csv",
+      "csv_glob": "Temp_CSV/Comptes/*_Audit_Comptes_365.csv",
       "start_row": 1,
       "header_map": {
-        "GivenName"              : "Name",
-        "UserPrincipalName"      : "Ordinateur",
-        "AccountCreatedDate"     : "Date de creation",
-        "LastPasswordChangeDate" : "PasswordLastSet"
+        "GivenName": "Name",
+        "UserPrincipalName": "Ordinateur",
+        "AccountCreatedDate": "Date de creation",
+        "LastPasswordChangeDate": "PasswordLastSet",
+        "LastSignInDate": "DerniereConnexion"
       }
     },
     {
@@ -64,7 +76,86 @@
       "template": "Templates_Excel/Template_Audit_NTFS.xlsx",
       "out_file": "Excel/Audit_NTFS.xlsx",
       "sheet": "NTFS",
-      "csv_glob": "Temp_CSV/*Audit_NTFS.csv",
+      "csv_glob": "Temp_CSV/NTFS/*_Audit_NTFS.csv",
+      "start_row": 1,
+      "header_map": {}
+    },
+    {
+      "name": "ntfs_partages",
+      "template": "Templates_Excel/Template_Audit_NTFS.xlsx",
+      "out_file": "Excel/Audit_NTFS_Partages.xlsx",
+      "sheet": "Partages",
+      "csv_glob": "Temp_CSV/NTFS/*_Audit_NTFS_Partages.csv",
+      "start_row": 1,
+      "header_map": {}
+    },
+    {
+      "name": "gpo",
+      "template": "Templates_Excel/Template_Audit_GPO.xlsx",
+      "out_file": "Excel/Audit_GPO.xlsx",
+      "sheet": "GPO",
+      "csv_glob": "Temp_CSV/AD/*Audit_GPO.csv",
+      "start_row": 3,
+      "header_map": {
+        "Cree par": "Créé par",
+        "Date de creation": "Date de création",
+        "OUs liees": "OUs liées",
+        "Active": "Activé",
+        "Utilite": "Utilité",
+        "Delegation": "Délégation"
+      }
+    },
+    {
+      "name": "groupes",
+      "template": "Templates_Excel/Template_Audit_Groupes.xlsx",
+      "out_file": "Excel/Audit_Groupes.xlsx",
+      "sheet": "Groupes",
+      "csv_glob": "Temp_CSV/AD/*_Audit_Groupes.csv",
+      "start_row": 1,
+      "header_map": {}
+    },
+    {
+      "name": "pso",
+      "template": "Templates_Excel/Template_Audit_PSO.xlsx",
+      "out_file": "Excel/pso.xlsx",
+      "sheet": "PSO",
+      "csv_glob": "Temp_CSV/AD/*_Audit_PSO.csv",
+      "start_row": 1,
+      "header_map": {}
+    },
+    {
+      "name": "pso_comptes",
+      "template": "Templates_Excel/Template_Audit_PSO.xlsx",
+      "out_file": "Excel/pso_comptes.xlsx",
+      "sheet": "Comptes",
+      "csv_glob": "Temp_CSV/AD/*_Audit_PSO_Comptes.csv",
+      "start_row": 1,
+      "header_map": {}
+    },
+    {
+      "name": "silos",
+      "template": "Templates_Excel/Template_Audit_Silos.xlsx",
+      "out_file": "Excel/silos.xlsx",
+      "sheet": "Silos",
+      "csv_glob": "Temp_CSV/AD/*_Audit_Silos.csv",
+      "start_row": 1,
+      "header_map": {}
+    },
+    {
+      "name": "silos_politiques",
+      "template": "Templates_Excel/Template_Audit_Silos.xlsx",
+      "out_file": "Excel/silos_politiques.xlsx",
+      "sheet": "Politiques",
+      "csv_glob": "Temp_CSV/AD/*_Audit_Silos_Politiques.csv",
+      "start_row": 1,
+      "header_map": {}
+    },
+    {
+      "name": "linux",
+      "template": "Templates_Excel/Template_Audit_Linux.xlsx",
+      "out_file": "Excel/Audit_Linux.xlsx",
+      "sheet": "Linux",
+      "csv_glob": "Temp_CSV/*_Audit_Linux.csv",
       "start_row": 1,
       "header_map": {}
     }

@@ -1,3 +1,7 @@
+# TemplateAuditGPO.py
+# Version      : 1.1
+# Derniere modif : Colonne Delegation (droits de modification accordes hors administrateurs)
+# Role         : Genere Template_Audit_GPO.xlsx
 import os
 
 # Repertoire de sortie :
@@ -25,7 +29,7 @@ ws = wb.active
 ws.title = "GPO"
 
 # Titre fusionné ligne 1
-ws.merge_cells("A1:H1")
+ws.merge_cells("A1:I1")
 title_cell = ws["A1"]
 title_cell.value = "GPO"
 title_cell.font = Font(bold=True, size=14, name="Arial")
@@ -44,11 +48,12 @@ headers = [
     "Date de création", # D - rempli par le script
     "OUs liées",        # E - rempli par le script
     "Activé",           # F - rempli par le script
-    "Description",      # G - manuel
-    "Utilité",          # H - manuel
+    "Délégation",       # G - rempli par le script
+    "Description",      # H - manuel
+    "Utilité",          # I - manuel
 ]
 
-col_widths = [20, 40, 25, 20, 50, 12, 40, 15]
+col_widths = [20, 40, 25, 20, 50, 12, 45, 40, 15]
 
 HEADER_FILL  = "4CAF50"   # vert foncé
 HEADER_FONT  = "FFFFFF"
@@ -62,8 +67,8 @@ for col, (header, width) in enumerate(zip(headers, col_widths), start=1):
 
 ws.row_dimensions[3].height = 20
 
-# Tableau structuré A3:H103
-table = Table(displayName="Table_GPO", ref="A3:H103")
+# Tableau structuré A3:I103
+table = Table(displayName="Table_GPO", ref="A3:I103")
 style = TableStyleInfo(
     name="TableStyleMedium7",   # vert clair, cohérent avec la capture
     showFirstColumn=False, showLastColumn=False,

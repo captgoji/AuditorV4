@@ -1,8 +1,13 @@
-# Encodage : UTF-8 avec BOM - ne pas modifier l'encodage du fichier
-# Version : 1.0
-# Derniere modif : Version initiale
+﻿# 13_Arborescence_OU.ps1
+# Version      : 1.2
+# Derniere modif : Ajout header standard
+# Role         : Genere l arborescence des OUs Active Directory en fichier texte
+# Usage        : Lance via main.ps1. Necessite RSAT AD sur DC.
+# ============================================================
+: UTF-8
 $OutputEncoding = [System.Text.Encoding]::UTF8
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+# [Console]::OutputEncoding peut planter en contexte WinRM (pas de handle console)
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 
 $tempCsv = $env:AUDIT_TEMP_CSV
 $CompSys  = Get-CimInstance Win32_ComputerSystem

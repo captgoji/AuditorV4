@@ -1,6 +1,11 @@
+﻿# 30_Audit_Replication.ps1
+# Version      : 1.5
+# Derniere modif : Sortie dans Temp_CSV\AD ; lecture du CSV VM corrigee (21_ ecrit
+#                  <HOST>Audit_VMs.csv sans '_' : l'ancien chemin fixe ne le trouvait jamais)
+# Role         : Audit replication AD via repadmin. Depend du CSV genere par 20_Audit_VMs.ps1
+# Usage        : Lance via main.ps1 apres 20_Audit_VMs. Necessite repadmin (RSAT) sur DC.
+# ============================================================
 # DEPENDANCE : ce script necessite que 20_Audit_VMs.ps1 ait ete execute au prealable.
-# Version : 1.3
-# Derniere modif : Fix _ CSV InputVMs, exit 0 si repadmin absent
 # Il lit le CSV genere dans Temp_CSV\VM\*Audit_VMs.csv.
 # Pour l'activer : retirer le prefixe "_" du nom de fichier.
  
@@ -8,8 +13,13 @@ $tempCsv    = $env:AUDIT_TEMP_CSV
 $CompSys    = Get-CimInstance Win32_ComputerSystem
 $DomainName = $CompSys.Domain
  
-$InputVMs   = "$tempCsv\VM\$env:COMPUTERNAME.$DomainName" + "_Audit_VMs.csv"
-$ExportFile = "$tempCsv\VM\$env:COMPUTERNAME.$DomainName" + "_Audit_Replication.csv"
+$AdDir      = if ($env:AUDIT_TEMP_AD) { $env:AUDIT_TEMP_AD } else { Join-Path $tempCsv "AD" }
+# Accepte <HOST>Audit_VMs.csv (sortie actuelle de 21_) comme <HOST>_Audit_VMs.csv
+$InputVMs   = Get-ChildItem -Path "$tempCsv\VM" -Filter "$env:COMPUTERNAME.$DomainName*Audit_VMs.csv" -File -ErrorAction SilentlyContinue |
+              Select-Object -First 1 -ExpandProperty FullName
+if (-not $InputVMs) { $InputVMs = "$tempCsv\VM\$env:COMPUTERNAME.$DomainName" + "Audit_VMs.csv" }
+$ExportFile = "$AdDir\$env:COMPUTERNAME.$DomainName" + "_Audit_Replication.csv"
+$null = New-Item -ItemType Directory -Force -Path $AdDir
  
 Write-Host "Audit replication : lecture des VMs dans $InputVMs"
  

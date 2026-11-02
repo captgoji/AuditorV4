@@ -1,5 +1,9 @@
-# Version : 1.1
-# Derniere modif : Fix separateur _ dans nom CSV
+﻿# 12_Audit_Comptes_365.ps1
+# Version      : 1.2
+# Derniere modif : Ajout header standard
+# Role         : Audit comptes Microsoft 365 : licences, connexions, MDP via Microsoft Graph API
+# Usage        : Lance via main.ps1. Necessite Microsoft.Graph installe et Connect-MgGraph.
+# ============================================================
 Connect-MgGraph
 
 $thresholdDate = (Get-Date).AddMonths(-6)
