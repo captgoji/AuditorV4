@@ -43,7 +43,7 @@
 | PowerShell | 5.1+ | — |
 | Outils RSAT (AD, GPMC, DFS) | — | ✅ via `init.ps1`, après confirmation (voir plus bas) |
 | Microsoft.Graph | 2.x | ✅ via `init.ps1` (si `12_Audit_Comptes_365` sélectionné) |
-| Nmap | 7.99 (portable) | Fourni dans `Tools\Nmap\` |
+| Nmap | 7.99 (portable) | Non fourni, à extraire dans `Tools\Nmap\` |
 | Npcap | 1.88 | ❌ installeur interactif lancé par `init.ps1` |
 | PsExec | — | ✅ via `init.ps1` (ou `Tools\PsExec64.exe` / `Tools\PSTools.zip`) |
 | Client SSH | — | OpenSSH installé si absent, sinon `Tools\plink.exe` |
