@@ -1,6 +1,9 @@
 Logs/
 *.log
-Excel/
-Temp_CSV/
-Tools/
+Excel/*
+!Excel/.gitkeep
+Temp_CSV/*
+!Temp_CSV/.gitkeep
+Tools/*
+!Tools/.gitkeep
 __pycache__/
